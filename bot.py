@@ -1,21 +1,24 @@
 """
-Bot Scalping v23.3 — BINANCE FUTURES LIVE & DEMO EXECUTION ENGINE
+Bot Scalping v23.4 — BINANCE FUTURES PAPER TRADING ENGINE
 ====================================================================
-UPDATES v23.3 (PAPER):
-- PAPER_TRADING = True -> SIMULASI. Tidak ada order dikirim ke Binance (tidak ada create_order /
-  change_leverage). Data pasar memakai mainnet publik. Fill disimulasikan di harga live, fee pakai FEE_RATE.
-  Set PAPER_TRADING = False untuk kembali ke mode DEMO / REAL seperti sebelumnya.
+UPDATES v23.4:
+- PAPER TRADING MODE (PAPER_TRADING = True): TIDAK ADA order yang dikirim ke Binance (mainnet maupun testnet).
+  Entry & exit disimulasikan memakai harga live (mark price WebSocket / REST ticker), fee disimulasikan
+  memakai FEE_RATE. Semua logika lain (scanner, filter, scoring, TP/SL, mode NORMAL/INVERTED,
+  cooldown, kill switch, target mingguan) TIDAK diubah.
+- Set PAPER_TRADING = False untuk kembali ke eksekusi API asli seperti v23.3.
 
 UPDATES v23.3:
 - HAPUS SEMUA EXIT BERBASIS WAKTU (MAX_HOLD_SECONDS, stagnant/time-limit exit). Posisi hanya
   ditutup oleh TP atau SL.
-- TP & SL FIXED dalam USDT, otomatis mengikuti pasangan margin kelipatan 3 (tanpa batas):
-      Margin 3 & 6   -> TP 1   | SL 0.5
-      Margin 9 & 12  -> TP 1.5 | SL 1
-      Margin 15 & 18 -> TP 2   | SL 1.5
-      Margin 21 & 24 -> TP 2.5 | SL 2
-      ... setiap pindah ke pasangan berikutnya: TP +0.5 dan SL +0.5 (selalu SL = TP - 0.5)
-  Margin di antara tingkatan dibulatkan ke kelipatan 3 terdekat.
+- TP & SL FIXED dalam USDT, otomatis mengikuti pola kelipatan 3 dari MARGIN (ORDER_USDT):
+      Margin $3  -> TP 1   | SL 0.5
+      Margin $6  -> TP 1.5 | SL 1
+      Margin $9  -> TP 2   | SL 1.5
+      Margin $12 -> TP 2.5 | SL 2
+      ... dst tanpa batas (ratusan, ribuan).
+  Aturan: setiap margin naik +3 -> TP +0.5 dan SL +0.5. SL selalu = TP - 0.5.
+  Margin di antara kelipatan 3 (mis. 4, 7, 10, 22) dibulatkan ke kelipatan 3 terdekat.
 - Harga TP/SL dihitung dari notional asli (qty x harga entry), dan dikompensasi fee (opsional)
   supaya PnL NET yang kena persis sesuai target.
 - Target mingguan tetap = ORDER_USDT (margin).
@@ -67,16 +70,16 @@ api_secret = os.getenv("API_SECRET")
 #  ACCOUNT CONFIGURATION
 # ═══════════════════════════════════════════════════════════════════════════
 USE_DEMO_ACCOUNT = True  # True = Binance Futures Testnet (Demo) | False = Real Binance Mainnet
-PAPER_TRADING = True     # True = SIMULASI: tidak ada order dikirim. Data pasar dari mainnet (publik).
-PAPER_SLIPPAGE_PCT = 0.0 # slippage simulasi per sisi (mis. 0.0002 = 0.02%). 0 = fill di harga live.
 
-ACC_LABEL = "PAPER TRADING" if PAPER_TRADING else ("DEMO TESTNET" if USE_DEMO_ACCOUNT else "REAL MAINNET")
+# ── PAPER TRADING ──────────────────────────────────────────────────────────
+# True  = SIMULASI: tidak ada order dikirim ke Binance. Entry/exit/fee dihitung lokal dari harga live.
+# False = Eksekusi order API asli (sesuai USE_DEMO_ACCOUNT).
+# Catatan: data pasar tetap diambil dari Binance sesuai USE_DEMO_ACCOUNT. Untuk paper trading yang
+# paling realistis, set USE_DEMO_ACCOUNT = False (data mainnet; aman karena tidak ada order yang dikirim).
+PAPER_TRADING = True
+PAPER_FILL_AT_TRIGGER = False   # True = exit paper di harga TP/SL persis | False = di harga live saat terdeteksi
 
-if PAPER_TRADING:
-    # Hanya untuk data pasar publik. API key tidak wajib.
-    client = Client(api_key, api_secret)
-    client.FUTURES_URL = "https://fapi.binance.com/fapi"
-elif USE_DEMO_ACCOUNT:
+if USE_DEMO_ACCOUNT:
     client = Client(api_key, api_secret, testnet=True)
     client.FUTURES_URL = "https://testnet.binancefuture.com/fapi"
 else:
@@ -88,6 +91,12 @@ DEPTH_SOCKET_CHUNK = 8
 MARK_PRICE_FAST = False
 
 WITA_TZ = timezone(timedelta(hours=8))
+
+def _acc_mode_label() -> str:
+    """Label mode akun untuk tampilan log/dashboard."""
+    if PAPER_TRADING:
+        return "PAPER TRADING"
+    return "DEMO TESTNET" if USE_DEMO_ACCOUNT else "REAL MAINNET"
 
 def _create_twm():
     kwargs = {"api_key": api_key, "api_secret": api_secret}
@@ -139,14 +148,14 @@ REST_RETRIES = 2
 MIN_SCORE                  = 58
 SAME_SIDE_EXTRA_SCORE      = 12
 
-# ── FIXED USDT RISK (PASANGAN MARGIN KELIPATAN 3, TANPA BATAS) ─────────────
-# Margin bergerak dalam pasangan kelipatan 3:
-#   (3,6) -> TP 1 / SL 0.5 | (9,12) -> TP 1.5 / SL 1 | (15,18) -> TP 2 / SL 1.5 | (21,24) -> TP 2.5 / SL 2 | dst.
-# Tiap pindah ke pasangan berikutnya: TP +0.5 dan SL +0.5. Selalu SL = TP - 0.5.
-BASE_TP_USDT     = 1.0    # TP untuk pasangan pertama (margin 3 & 6)
-TIER_STEP_USDT   = 0.5    # kenaikan TP & SL per pasangan berikutnya
-SL_GAP_USDT      = 0.5    # SL = TP - SL_GAP_USDT
-MARGIN_UNIT      = 3.0    # margin dalam kelipatan 3
+# ── FIXED USDT RISK (POLA KELIPATAN 3 DARI MARGIN) ─────────────────────────
+# Tingkat n = margin / 3 (dibulatkan ke kelipatan 3 terdekat, minimal 1).
+#   TP = BASE_TP_USDT + (n - 1) * TP_STEP_USDT      -> margin 3 = 1 | 6 = 1.5 | 9 = 2 | 12 = 2.5 | ...
+#   SL = TP - TP_SL_GAP                              -> margin 3 = 0.5 | 6 = 1 | 9 = 1.5 | 12 = 2 | ...
+MARGIN_STEP  = 3.0   # margin naik per tingkat
+BASE_TP_USDT = 1.0   # TP di tingkat pertama (margin 3)
+TP_STEP_USDT = 0.5   # kenaikan TP per +3 margin (SL ikut naik sama karena SL = TP - gap)
+TP_SL_GAP    = 0.5   # SL selalu lebih kecil 0.5 dari TP
 
 FEE_RATE          = 0.0004   # taker fee per sisi (0.04%) — dipakai untuk kompensasi fee
 FEE_COMPENSATION  = True     # True = PnL NET (setelah fee) yang kena target TP/SL | False = PnL GROSS
@@ -156,18 +165,15 @@ COIN_COOLDOWN_SEC = 900    # 15 menit cooldown setelah exit per koin
 def tp_sl_usdt(margin: float = None) -> Tuple[float, float]:
     """
     Return (TP_USDT, SL_USDT) per trade berdasarkan margin (default ORDER_USDT).
-    Margin dibulatkan ke kelipatan 3 terdekat, lalu tingkat pasangan:
-        tier = floor((kelipatan3 - 1) / 2)   -> 3,6 = 0 | 9,12 = 1 | 15,18 = 2 | ...
-        TP = BASE_TP_USDT + tier * TIER_STEP_USDT
-        SL = TP - SL_GAP_USDT
+    Margin dibulatkan ke kelipatan 3 terdekat (minimal tingkat 1), lalu:
+        TP = BASE_TP_USDT + (tingkat - 1) * TP_STEP_USDT
+        SL = TP - TP_SL_GAP
     """
     if margin is None:
         margin = ORDER_USDT
-    units = int(math.floor(margin / MARGIN_UNIT + 0.5))   # margin dibulatkan ke kelipatan 3 terdekat (7.5 -> 9)
-    units = max(units, 1)                                  # margin di bawah 3 dianggap tingkat pertama
-    tier = (units - 1) // 2
-    tp = BASE_TP_USDT + tier * TIER_STEP_USDT
-    sl = tp - SL_GAP_USDT
+    tier = max(1, int(math.floor(margin / MARGIN_STEP + 0.5)))
+    tp = BASE_TP_USDT + (tier - 1) * TP_STEP_USDT
+    sl = tp - TP_SL_GAP
     return tp, sl
 
 # Institutional Order Book
@@ -408,7 +414,7 @@ class AbsorptionDetector:
         return bull_absorb, bear_absorb, " ".join(details)
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  RISK MANAGEMENT — FIXED USDT TP/SL (PASANGAN MARGIN KELIPATAN 3)
+#  RISK MANAGEMENT — FIXED USDT TP/SL (POLA KELIPATAN 3 DARI MARGIN)
 # ═══════════════════════════════════════════════════════════════════════════
 
 class DynamicRiskManager:
@@ -416,7 +422,7 @@ class DynamicRiskManager:
     def calculate_levels(entry_price: float, execution_side: str, atr: float, quantity: float = None) -> Dict[str, float]:
         """
         TP/SL ditentukan dari NILAI USDT (lihat tp_sl_usdt), bukan dari ATR/persen:
-            margin 3,6 -> TP 1 / SL 0.5 | margin 9,12 -> TP 1.5 / SL 1 | margin 15,18 -> TP 2 / SL 1.5 | dst
+            margin 3 -> TP 1 / SL 0.5 | margin 6 -> TP 1.5 / SL 1 | margin 9 -> TP 2 / SL 1.5 | dst (SL = TP - 0.5)
         Harga TP/SL = entry +/- (target USDT / notional), notional = quantity x entry
         (kalau quantity tidak diberikan, dipakai notional ideal = margin x leverage).
         Jika FEE_COMPENSATION aktif, TP digeser sedikit lebih jauh dan SL sedikit lebih dekat
@@ -957,7 +963,7 @@ def ks_upd(pnl):
     _ks["consec"] = 0 if pnl >= 0 else _ks["consec"] + 1
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  REAL API BINANCE EXECUTION ENGINE (GUARDED LIVE OPEN & CLOSE)
+#  EXECUTION ENGINE (PAPER TRADING / REAL API — GUARDED OPEN & CLOSE)
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _fetch_order_fills(sym, order_id, tries=5, delay=0.6):
@@ -965,6 +971,7 @@ def _fetch_order_fills(sym, order_id, tries=5, delay=0.6):
     FIX PNL SYNC: ambil data fill ASLI dari Binance (userTrades) untuk 1 order:
     harga rata-rata fill, qty, realizedPnl, dan commission (fee) yang sama persis dengan yang tampil di exchange.
     Return dict, atau None kalau data fill belum tersedia setelah beberapa kali coba.
+    (Paper trading: tidak ada order asli, jadi fungsi ini tidak dipanggil.)
     """
     if not order_id:
         return None
@@ -1029,19 +1036,18 @@ def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym, risk_p
         with _lock: live_positions.pop(sym, None)
         return
 
-    order_side = "BUY" if execution_side == "LONG" else "SELL"
-
-    if PAPER_TRADING:
-        # SIMULASI: tidak ada order ke exchange. Fill di harga live (+ slippage opsional).
-        price = price * (1 + PAPER_SLIPPAGE_PCT) if execution_side == "LONG" else price * (1 - PAPER_SLIPPAGE_PCT)
-        order_res = {"orderId": "PAPER"}
-        entry_fill = {"avg_price": price, "qty": q_val, "realized_pnl": 0.0, "fee": price * q_val * FEE_RATE}
-    else:
+    if not PAPER_TRADING:
         try:
             _rest_call(f"set_leverage_{sym}", client.futures_change_leverage, symbol=sym, leverage=LEVERAGE)
         except Exception as e:
             _log_err(f"set_leverage_{sym}", e)
 
+    order_side = "BUY" if execution_side == "LONG" else "SELL"
+
+    if PAPER_TRADING:
+        # PAPER: tidak ada order ke Binance. Fill disimulasikan di harga live saat ini.
+        order_res = {"orderId": None, "avgPrice": price}
+    else:
         try:
             order_res = _rest_call(
                 f"open_order_{sym}",
@@ -1051,7 +1057,7 @@ def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym, risk_p
                 type="MARKET",
                 quantity=q_val
             )
-
+            
             avg_price = float(order_res.get("avgPrice", 0.0))
             if avg_price > 0:
                 price = avg_price
@@ -1060,19 +1066,24 @@ def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym, risk_p
             with _lock: live_positions.pop(sym, None)
             return
 
-        # FIX PNL SYNC: avgPrice dari respons MARKET order sering 0 -> sebelumnya entry memakai harga mark/ticker (bukan harga fill).
-        # Sekarang entry price & fee diambil dari fill asli exchange.
+    # FIX PNL SYNC: avgPrice dari respons MARKET order sering 0 -> sebelumnya entry memakai harga mark/ticker (bukan harga fill).
+    # Sekarang entry price & fee diambil dari fill asli exchange.
+    # PAPER: tidak ada fill asli; fee entry disimulasikan dari notional x FEE_RATE.
+    if PAPER_TRADING:
+        entry_fill = None
+        paper_entry_fee = price * q_val * FEE_RATE
+    else:
         entry_fill = _fetch_order_fills(sym, order_res.get("orderId"))
-        if not entry_fill:
+        paper_entry_fee = None
+        if entry_fill:
+            price = entry_fill["avg_price"]
+        else:
             print(f"  ⚠️ [FILL SYNC] Fill ENTRY {sym} belum terbaca dari exchange — entry pakai estimasi harga.")
-
-    if entry_fill:
-        price = entry_fill["avg_price"]
 
     # TP/SL fixed USDT: dihitung dari harga entry asli + qty asli
     risk = DynamicRiskManager.calculate_levels(price, execution_side, atr, quantity=q_val)
     open_ts = time.time()
-    acc_label = ACC_LABEL
+    acc_label = _acc_mode_label()
 
     pos = {
         "side": execution_side,
@@ -1095,15 +1106,16 @@ def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym, risk_p
         "peak_price": price,
         "mode": entry_mode,
         "order_id": order_res.get("orderId"),
-        "entry_fee": entry_fill["fee"] if entry_fill else None,
+        "entry_fee": entry_fill["fee"] if entry_fill else paper_entry_fee,
     }
 
     with _lock:
         live_positions[sym] = pos
 
     d = "🟢" if execution_side == "LONG" else "🔴"
+    exec_tag = "PAPER ORDER OPENED" if PAPER_TRADING else "API ORDER EXECUTED"
     print(
-        f"\n  {d} [API ORDER EXECUTED] [{acc_label}] {sym} EXEC:{execution_side} (Signal:{orig_direction} | Mode:{entry_mode}) @{price:.6g} | "
+        f"\n  {d} [{exec_tag}] [{acc_label}] {sym} EXEC:{execution_side} (Signal:{orig_direction} | Mode:{entry_mode}) @{price:.6g} | "
         f"QTY:{q_val:.8g} | TP:+{risk['tp_usdt']:.2f}U ({risk['tp_pct']*100:.2f}%) @{risk['tp_price']:.6g} | "
         f"SL:-{risk['sl_usdt']:.2f}U ({risk['sl_pct']*100:.2f}%) @{risk['sl_price']:.6g} | In:{pos['open_time_wita']} WITA"
     )
@@ -1128,12 +1140,19 @@ def live_close(sym, reason, price=None):
     close_side = "SELL" if side == "LONG" else "BUY"
 
     if PAPER_TRADING:
-        # SIMULASI: tutup di harga live saat ini (bukan di level TP/SL), jadi slippage SL tetap realistis.
-        px_fill = price_live(sym)
-        if px_fill <= 0:
-            px_fill = price if (price and price > 0) else pos["entry"]
-        price = px_fill * (1 - PAPER_SLIPPAGE_PCT) if side == "LONG" else px_fill * (1 + PAPER_SLIPPAGE_PCT)
-        close_res = {"orderId": "PAPER"}
+        # PAPER: tidak ada order ke Binance. Fill disimulasikan di harga live (atau harga trigger TP/SL
+        # kalau PAPER_FILL_AT_TRIGGER = True).
+        trigger_px = price
+        px_now = price_live(sym)
+        if PAPER_FILL_AT_TRIGGER and trigger_px and trigger_px > 0:
+            sim_px = trigger_px
+        elif px_now > 0:
+            sim_px = px_now
+        else:
+            sim_px = trigger_px if trigger_px else 0.0
+        close_res = {"orderId": None, "avgPrice": sim_px}
+        if sim_px > 0:
+            price = sim_px
     else:
         try:
             close_res = _rest_call(
@@ -1161,16 +1180,12 @@ def live_close(sym, reason, price=None):
 
     # FIX PNL SYNC: PnL diambil dari fill ASLI exchange (harga fill, realizedPnl, fee) — sama dengan yang tampil di Binance.
     # gross_pnl = "PNL Terealisasi" di riwayat perdagangan Binance, pnl (net) = gross - fee entry - fee exit.
+    # PAPER: tidak ada fill asli -> PnL dihitung dari harga simulasi + fee simulasi (bukan estimasi "EST").
     pnl_synced = False
     gross_pnl = 0.0
     fee_entry = 0.0
     fee_exit = 0.0
-
-    if PAPER_TRADING:
-        _g = (price - entry) * q_val if side == "LONG" else (entry - price) * q_val
-        close_fill = {"avg_price": price, "qty": q_val, "realized_pnl": _g, "fee": price * q_val * FEE_RATE}
-    else:
-        close_fill = _fetch_order_fills(sym, close_res.get("orderId"))
+    close_fill = None if PAPER_TRADING else _fetch_order_fills(sym, close_res.get("orderId"))
 
     if close_fill:
         price = close_fill["avg_price"]
@@ -1183,7 +1198,8 @@ def live_close(sym, reason, price=None):
         pnl = gross_pnl - fee_entry - fee_exit
         pnl_synced = True
     else:
-        print(f"  ⚠️ [FILL SYNC] Fill CLOSE {sym} belum terbaca dari exchange — PnL ini ESTIMASI (ditandai EST).")
+        if not PAPER_TRADING:
+            print(f"  ⚠️ [FILL SYNC] Fill CLOSE {sym} belum terbaca dari exchange — PnL ini ESTIMASI (ditandai EST).")
         if side == "LONG":
             gross_pnl = (price - entry) * q_val
         else:
@@ -1232,8 +1248,9 @@ def live_close(sym, reason, price=None):
     with _lock:
         live_positions.pop(sym, None)
 
+    exit_tag = "PAPER EXIT CLOSED" if PAPER_TRADING else "API EXIT CLOSED"
     print(
-        f"  {e_icon} [API EXIT CLOSED] {sym} {side} CLOSE [{entry_mode}] — {reason} | "
+        f"  {e_icon} [{exit_tag}] {sym} {side} CLOSE [{entry_mode}] — {reason} | "
         f"{entry:.6g}→{price:.6g} ({pct:+.3f}%) hold:{hold:.0f}s | PnL Net:{pnl:+.5f}U (Gross:{gross_pnl:+.5f} Fee:{fee_entry + fee_exit:.5f}){sync_tag} | Out:{close_wita} WITA"
     )
 
@@ -1269,7 +1286,7 @@ def live_close(sym, reason, price=None):
         "sym": sym, "side": side, "entry": round(entry, 7),
         "exit": round(price, 7), "pnl": round(pnl, 5),
         "gross": round(gross_pnl, 5), "fee": round(fee_entry + fee_exit, 5),
-        "est": (not pnl_synced),
+        "est": (not pnl_synced and not PAPER_TRADING),
         "reason": reason, "hold": int(hold),
         "in_wita": open_wita,
         "out_wita": close_wita,
@@ -1393,8 +1410,8 @@ def print_inline():
     mode_str = "INVERTED" if is_logic_inverted else "NORMAL"
     forced_str = f"({_inverted_forced_side})" if _inverted_forced_side else ""
     failed_str = f"| SameSideLock:{_last_failed_execution_side}" if _last_failed_execution_side else ""
-    acc_mode = ACC_LABEL
-    print(f"        ┌ [API ENGINE v23.3 ({acc_mode}) - MODE: {mode_str}{forced_str}] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} PnL:{pnl:+.4f}U {failed_str}")
+    acc_mode = _acc_mode_label()
+    print(f"        ┌ [API ENGINE v23.4 ({acc_mode}) - MODE: {mode_str}{forced_str}] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} PnL:{pnl:+.4f}U {failed_str}")
     print(f"        └ TP:{_stats['tp_exit']} SL:{_stats['hard_sl']} | VolVeto:{_stats['low_vol_veto']} | SameSideVeto:{_stats['same_side_veto']} | Weekly:{_weekly_pnl:+.4f}U/${ORDER_USDT:.2f}U")
 
 def print_full():
@@ -1405,7 +1422,7 @@ def print_full():
     forced_str = f" [{_inverted_forced_side} ONLY]" if _inverted_forced_side else ""
     now_wita = datetime.now(tz=WITA_TZ).strftime("%H:%M:%S WITA")
     failed_str = f" [SAME-SIDE GUARD ACTIVE: {_last_failed_execution_side}]" if _last_failed_execution_side else ""
-    acc_mode = ACC_LABEL
+    acc_mode = _acc_mode_label()
     tp_u, sl_u = tp_sl_usdt()
     
     print(f"\n  {'─'*72}")
@@ -1563,10 +1580,13 @@ def handle_depth_multiplex(msg):
         _log_err(f"handle_depth_multiplex", e)
 
 def run_bot():
-    acc_type_str = "PAPER TRADING (SIMULASI, DATA MAINNET)" if PAPER_TRADING else ("BINANCE FUTURES DEMO (TESTNET)" if USE_DEMO_ACCOUNT else "BINANCE FUTURES REAL MAINNET")
+    if PAPER_TRADING:
+        acc_type_str = "PAPER TRADING (SIMULASI - TANPA ORDER)"
+    else:
+        acc_type_str = "BINANCE FUTURES DEMO (TESTNET)" if USE_DEMO_ACCOUNT else "BINANCE FUTURES REAL MAINNET"
     tp_u, sl_u = tp_sl_usdt()
     print("╔════════════════════════════════════════════════════════════════════╗")
-    print(f"║  💎 BOT SCALPING v23.3 — LIVE BINANCE API EXECUTION ENGINE         ║")
+    print(f"║  💎 BOT SCALPING v23.4 — {'PAPER TRADING ENGINE' if PAPER_TRADING else 'LIVE BINANCE API EXECUTION ENGINE'}{' ' * (42 if PAPER_TRADING else 26)}║")
     print(f"║  MODE AKUN: {acc_type_str:<51} ║")
     print("║  1. Mode Awal: NORMAL (Arah Bebas Sesuai Sinyal Indikator)         ║")
     print("║  2. Strict Filter: Volume Ratio >= 0.85 & ADX >= 20 (Anti-Sideway) ║")
