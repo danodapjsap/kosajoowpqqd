@@ -2,9 +2,11 @@
 Bot Scalping v23.4 — BINANCE FUTURES LIVE & DEMO EXECUTION ENGINE
 ====================================================================
 UPDATES v23.4-PAPER:
-- MODE PAPER TRADING (PAPER_TRADING = True): semua logika sama persis, tapi TIDAK ADA order yang dikirim
-  ke Binance. Entry/exit disimulasikan dari harga live (+ slippage kecil) dengan fee 0.04% per sisi.
-  Ubah PAPER_TRADING = False untuk kembali ke eksekusi API asli (demo/real sesuai USE_DEMO_ACCOUNT).
+- MODE PAPER TRADING (PAPER_TRADING = True): semua logika & sumber data SAMA PERSIS dengan versi asli
+  (akun demo/testnet sesuai USE_DEMO_ACCOUNT), tapi TIDAK ADA order yang dikirim ke Binance.
+  Entry/exit disimulasikan dari harga live (+ slippage kecil) dengan fee 0.04% per sisi.
+  Ubah PAPER_TRADING = False untuk kembali ke eksekusi API asli.
+- Dashboard menampilkan rincian veto filter volume/ADX/ATR (hanya penghitung, filter tidak diubah).
 
 UPDATES v23.4:
 - TIME LIMIT SAAT MINUS: kalau posisi floating minus terus-menerus selama LOSS_TIME_LIMIT_SEC
@@ -73,11 +75,9 @@ api_secret = os.getenv("API_SECRET")
 USE_DEMO_ACCOUNT = True  # True = Binance Futures Testnet (Demo) | False = Real Binance Mainnet
 
 # PAPER: True = simulasi saja, TIDAK ADA order dikirim ke Binance. False = eksekusi API asli.
-PAPER_TRADING          = True
-# PAPER: True = ambil data pasar dari mainnet (publik, tanpa order). False = ikut USE_DEMO_ACCOUNT.
-PAPER_USE_MAINNET_DATA = False
+PAPER_TRADING      = True
 # PAPER: slippage simulasi per eksekusi (0.0001 = 0.01%), selalu merugikan posisi.
-PAPER_SLIPPAGE_PCT     = 0.0001
+PAPER_SLIPPAGE_PCT = 0.0001
 
 if PAPER_TRADING:
     ACC_LABEL = "PAPER TRADING"
@@ -86,10 +86,8 @@ elif USE_DEMO_ACCOUNT:
 else:
     ACC_LABEL = "REAL MAINNET"
 
-if PAPER_TRADING and PAPER_USE_MAINNET_DATA:
-    client = Client(api_key, api_secret)
-    client.FUTURES_URL = "https://fapi.binance.com/fapi"
-elif USE_DEMO_ACCOUNT:
+# Pembuatan client SAMA PERSIS dengan kode asli (paper mode tidak mengubah sumber data).
+if USE_DEMO_ACCOUNT:
     client = Client(api_key, api_secret, testnet=True)
     client.FUTURES_URL = "https://testnet.binancefuture.com/fapi"
 else:
@@ -721,6 +719,7 @@ _stats = {
     "hard_sl": 0, "tp_exit": 0, "time_limit_exit": 0, "regime_block": 0,
     "wall_veto": 0, "btc_breaker_veto": 0, "spoof_veto": 0, "absorb_entries": 0,
     "low_vol_veto": 0, "same_side_veto": 0,
+    "veto_vr": 0, "veto_adx": 0, "veto_atr": 0,   # PAPER: rincian alasan low_vol_veto (hanya penghitung)
     "hist": deque(maxlen=200), "start": time.time(),
 }
 
@@ -1373,6 +1372,10 @@ def scan_one(sym):
         # ── FILTER 1: Volume & Sideway Guard ─────────────────────────
         if vr_val < MIN_VOLUME_RATIO or adx_val < MIN_ADX_TREND or (atr_val / px_candle) < MIN_ATR_PCT:
             _stats["low_vol_veto"] += 1
+            # PAPER: hanya penghitung rincian alasan veto (filter tidak diubah)
+            if vr_val < MIN_VOLUME_RATIO: _stats["veto_vr"] += 1
+            if adx_val < MIN_ADX_TREND: _stats["veto_adx"] += 1
+            if (atr_val / px_candle) < MIN_ATR_PCT: _stats["veto_atr"] += 1
             return None
 
         orig_direction, score, sigs, _, regime, bias = scorer.get_signal(df_ta, sym)
@@ -1465,6 +1468,7 @@ def print_full():
     print(f"    PnL Net:{pnl:+.5f}U | Weekly PnL:{_weekly_pnl:+.5f}U / Target:${ORDER_USDT:.2f}U | ATH PnL:{_stats['ath_pnl']:+.5f}U")
     print(f"    🏆 Best Win:{_stats['best']:+.5f}U | 💥 Worst Loss:{_stats['worst']:+.5f}U")
     print(f"    📈 Exit: TP:{_stats['tp_exit']} | SL:{_stats['hard_sl']} | LossTO:{_stats['time_limit_exit']} | VolVeto:{_stats['low_vol_veto']} | SameSideVeto:{_stats['same_side_veto']}")
+    print(f"    🔎 Rincian VolVeto (1 koin bisa kena >1 alasan): Vol<{MIN_VOLUME_RATIO}:{_stats['veto_vr']} | ADX<{MIN_ADX_TREND:.0f}:{_stats['veto_adx']} | ATR%<{MIN_ATR_PCT*100:.2f}%:{_stats['veto_atr']}")
 
     if trade_log:
         print(f"    {'─'*68}\n    📋 Last 5 Trades (Makassar / WITA Timezone):")
@@ -1617,8 +1621,9 @@ def run_bot():
     if not PAPER_TRADING:
         acc_type_str = "BINANCE FUTURES DEMO (TESTNET)" if USE_DEMO_ACCOUNT else "BINANCE FUTURES REAL MAINNET"
     tp_u, sl_u = tp_sl_usdt()
+    title_txt = "PAPER TRADING ENGINE (NO REAL ORDERS)" if PAPER_TRADING else "LIVE BINANCE API EXECUTION ENGINE"
     print("╔════════════════════════════════════════════════════════════════════╗")
-    print(f"║  💎 BOT SCALPING v23.4 — {'PAPER TRADING ENGINE (NO REAL ORDERS)' if PAPER_TRADING else 'LIVE BINANCE API EXECUTION ENGINE'}{' ' * (41 - len('PAPER TRADING ENGINE (NO REAL ORDERS)' if PAPER_TRADING else 'LIVE BINANCE API EXECUTION ENGINE'))}║")
+    print(f"║  💎 BOT SCALPING v23.4 — {title_txt:<42}║")
     print(f"║  MODE AKUN: {acc_type_str:<51} ║")
     print("║  1. Mode Awal: NORMAL (Arah Bebas Sesuai Sinyal Indikator)         ║")
     print("║  2. Strict Filter: Volume Ratio >= 0.85 & ADX >= 20 (Anti-Sideway) ║")
