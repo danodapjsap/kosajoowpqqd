@@ -75,7 +75,7 @@ USE_DEMO_ACCOUNT = True  # True = Binance Futures Testnet (Demo) | False = Real 
 # PAPER: True = simulasi saja, TIDAK ADA order dikirim ke Binance. False = eksekusi API asli.
 PAPER_TRADING          = True
 # PAPER: True = ambil data pasar dari mainnet (publik, tanpa order). False = ikut USE_DEMO_ACCOUNT.
-PAPER_USE_MAINNET_DATA = True
+PAPER_USE_MAINNET_DATA = False
 # PAPER: slippage simulasi per eksekusi (0.0001 = 0.01%), selalu merugikan posisi.
 PAPER_SLIPPAGE_PCT     = 0.0001
 
