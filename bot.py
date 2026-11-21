@@ -1,6 +1,11 @@
 """
 Bot Scalping v23.4 — BINANCE FUTURES LIVE & DEMO EXECUTION ENGINE
 ====================================================================
+UPDATES v23.6:
+- PAPER TRADING: set PAPER_TRADING = True -> tidak ada order yang dikirim ke Binance. Data market (harga, kline,
+  order book) tetap real dari Binance Futures mainnet (endpoint publik), entry/exit & PnL disimulasikan lokal
+  (fee pakai FEE_RATE). Set PAPER_TRADING = False untuk kembali ke mode lama (DEMO/REAL).
+
 UPDATES v23.5:
 - TARGET MINGGUAN OTOMATIS IKUT MARGIN: margin $3 -> target $2/minggu. Setiap margin naik +$3,
   target mingguan naik +$2 (margin $6 -> $4 | $9 -> $6 | $12 -> $8 | ... | $300 -> $200 | dst).
@@ -71,9 +76,14 @@ api_secret = os.getenv("API_SECRET")
 # ═══════════════════════════════════════════════════════════════════════════
 #  ACCOUNT CONFIGURATION
 # ═══════════════════════════════════════════════════════════════════════════
+PAPER_TRADING = True      # PAPER: True = simulasi lokal (TANPA order ke Binance) | False = kirim order (DEMO/REAL sesuai di bawah)
 USE_DEMO_ACCOUNT = True  # True = Binance Futures Testnet (Demo) | False = Real Binance Mainnet
 
-if USE_DEMO_ACCOUNT:
+if PAPER_TRADING:
+    # PAPER: ambil data market real dari mainnet (hanya endpoint publik), tidak ada order yang dikirim
+    client = Client(api_key, api_secret)
+    client.FUTURES_URL = "https://fapi.binance.com/fapi"
+elif USE_DEMO_ACCOUNT:
     client = Client(api_key, api_secret, testnet=True)
     client.FUTURES_URL = "https://testnet.binancefuture.com/fapi"
 else:
@@ -1038,43 +1048,53 @@ def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym, risk_p
         with _lock: live_positions.pop(sym, None)
         return
 
-    try:
-        _rest_call(f"set_leverage_{sym}", client.futures_change_leverage, symbol=sym, leverage=LEVERAGE)
-    except Exception as e:
-        _log_err(f"set_leverage_{sym}", e)
+    # PAPER: tidak set leverage ke exchange
+    if not PAPER_TRADING:
+        try:
+            _rest_call(f"set_leverage_{sym}", client.futures_change_leverage, symbol=sym, leverage=LEVERAGE)
+        except Exception as e:
+            _log_err(f"set_leverage_{sym}", e)
 
     order_side = "BUY" if execution_side == "LONG" else "SELL"
 
-    try:
-        order_res = _rest_call(
-            f"open_order_{sym}",
-            client.futures_create_order,
-            symbol=sym,
-            side=order_side,
-            type="MARKET",
-            quantity=q_val
-        )
-        
-        avg_price = float(order_res.get("avgPrice", 0.0))
-        if avg_price > 0:
-            price = avg_price
-    except Exception as e:
-        print(f"  ❌ [API ORDER ERROR] Gagal Membuka Posisi {execution_side} pada {sym}: {e}")
-        with _lock: live_positions.pop(sym, None)
-        return
+    # PAPER: order disimulasikan (tidak dikirim ke Binance), fill di harga live saat ini
+    if PAPER_TRADING:
+        order_res = {"orderId": None, "avgPrice": price}
+    else:
+        try:
+            order_res = _rest_call(
+                f"open_order_{sym}",
+                client.futures_create_order,
+                symbol=sym,
+                side=order_side,
+                type="MARKET",
+                quantity=q_val
+            )
+            
+            avg_price = float(order_res.get("avgPrice", 0.0))
+            if avg_price > 0:
+                price = avg_price
+        except Exception as e:
+            print(f"  ❌ [API ORDER ERROR] Gagal Membuka Posisi {execution_side} pada {sym}: {e}")
+            with _lock: live_positions.pop(sym, None)
+            return
 
     # FIX PNL SYNC: avgPrice dari respons MARKET order sering 0 -> sebelumnya entry memakai harga mark/ticker (bukan harga fill).
     # Sekarang entry price & fee diambil dari fill asli exchange.
-    entry_fill = _fetch_order_fills(sym, order_res.get("orderId"))
-    if entry_fill:
-        price = entry_fill["avg_price"]
+    if PAPER_TRADING:
+        # PAPER: fill simulasi, fee = FEE_RATE x notional
+        entry_fill = {"avg_price": price, "qty": q_val, "realized_pnl": 0.0, "fee": price * q_val * FEE_RATE}
     else:
-        print(f"  ⚠️ [FILL SYNC] Fill ENTRY {sym} belum terbaca dari exchange — entry pakai estimasi harga.")
+        entry_fill = _fetch_order_fills(sym, order_res.get("orderId"))
+        if entry_fill:
+            price = entry_fill["avg_price"]
+        else:
+            print(f"  ⚠️ [FILL SYNC] Fill ENTRY {sym} belum terbaca dari exchange — entry pakai estimasi harga.")
 
     # TP/SL fixed USDT: dihitung dari harga entry asli + qty asli
     risk = DynamicRiskManager.calculate_levels(price, execution_side, atr, quantity=q_val)
     open_ts = time.time()
-    acc_label = "TESTNET DEMO" if USE_DEMO_ACCOUNT else "REAL MAINNET"
+    acc_label = "PAPER TRADING" if PAPER_TRADING else ("TESTNET DEMO" if USE_DEMO_ACCOUNT else "REAL MAINNET")
 
     pos = {
         "side": execution_side,
@@ -1130,23 +1150,27 @@ def live_close(sym, reason, price=None):
     q_val = pos["qty"]
     close_side = "SELL" if side == "LONG" else "BUY"
 
-    try:
-        close_res = _rest_call(
-            f"close_order_{sym}",
-            client.futures_create_order,
-            symbol=sym,
-            side=close_side,
-            type="MARKET",
-            quantity=q_val,
-            reduceOnly=True
-        )
-        avg_close_price = float(close_res.get("avgPrice", 0.0))
-        if avg_close_price > 0:
-            price = avg_close_price
-    except Exception as e:
-        print(f"  ❌ [API CLOSE ERROR] Gagal Tutup Posisi {side} pada {sym}: {e}")
-        pos["_closing"] = False   # posisi masih ada di live_positions, monitor boleh coba lagi
-        return
+    # PAPER: order close disimulasikan (tidak dikirim ke Binance), fill di harga yang diberikan monitor (TP/SL/px)
+    if PAPER_TRADING:
+        close_res = {"orderId": None, "avgPrice": 0.0}
+    else:
+        try:
+            close_res = _rest_call(
+                f"close_order_{sym}",
+                client.futures_create_order,
+                symbol=sym,
+                side=close_side,
+                type="MARKET",
+                quantity=q_val,
+                reduceOnly=True
+            )
+            avg_close_price = float(close_res.get("avgPrice", 0.0))
+            if avg_close_price > 0:
+                price = avg_close_price
+        except Exception as e:
+            print(f"  ❌ [API CLOSE ERROR] Gagal Tutup Posisi {side} pada {sym}: {e}")
+            pos["_closing"] = False   # posisi masih ada di live_positions, monitor boleh coba lagi
+            return
 
     if price is None or price <= 0:
         price = price_live(sym)
@@ -1160,7 +1184,13 @@ def live_close(sym, reason, price=None):
     gross_pnl = 0.0
     fee_entry = 0.0
     fee_exit = 0.0
-    close_fill = _fetch_order_fills(sym, close_res.get("orderId"))
+
+    if PAPER_TRADING:
+        # PAPER: fill & PnL simulasi (gross dari selisih harga x qty, fee = FEE_RATE x notional)
+        paper_gross = (price - entry) * q_val if side == "LONG" else (entry - price) * q_val
+        close_fill = {"avg_price": price, "qty": q_val, "realized_pnl": paper_gross, "fee": price * q_val * FEE_RATE}
+    else:
+        close_fill = _fetch_order_fills(sym, close_res.get("orderId"))
 
     if close_fill:
         price = close_fill["avg_price"]
@@ -1186,6 +1216,7 @@ def live_close(sym, reason, price=None):
         pnl = gross_pnl - (fee_entry + fee_exit)
 
     sync_tag = "" if pnl_synced else " (EST)"
+    if PAPER_TRADING: sync_tag = " (PAPER)"
 
     pct = ((price - entry) / entry * 100) if side == "LONG" else ((entry - price) / entry * 100)
     close_ts = time.time()
@@ -1399,7 +1430,7 @@ def print_inline():
     mode_str = "INVERTED" if is_logic_inverted else "NORMAL"
     forced_str = f"({_inverted_forced_side})" if _inverted_forced_side else ""
     failed_str = f"| SameSideLock:{_last_failed_execution_side}" if _last_failed_execution_side else ""
-    acc_mode = "DEMO TESTNET" if USE_DEMO_ACCOUNT else "REAL MAINNET"
+    acc_mode = "PAPER TRADING" if PAPER_TRADING else ("DEMO TESTNET" if USE_DEMO_ACCOUNT else "REAL MAINNET")
     print(f"        ┌ [API ENGINE v23.5 ({acc_mode}) - MODE: {mode_str}{forced_str}] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} PnL:{pnl:+.4f}U {failed_str}")
     print(f"        └ TP:{_stats['tp_exit']} SL:{_stats['hard_sl']} LossTO:{_stats['time_limit_exit']} | VolVeto:{_stats['low_vol_veto']} | SameSideVeto:{_stats['same_side_veto']} | Weekly:{_weekly_pnl:+.4f}U/${weekly_target_usdt():.2f}U")
 
@@ -1411,7 +1442,7 @@ def print_full():
     forced_str = f" [{_inverted_forced_side} ONLY]" if _inverted_forced_side else ""
     now_wita = datetime.now(tz=WITA_TZ).strftime("%H:%M:%S WITA")
     failed_str = f" [SAME-SIDE GUARD ACTIVE: {_last_failed_execution_side}]" if _last_failed_execution_side else ""
-    acc_mode = "DEMO TESTNET" if USE_DEMO_ACCOUNT else "REAL MAINNET"
+    acc_mode = "PAPER TRADING" if PAPER_TRADING else ("DEMO TESTNET" if USE_DEMO_ACCOUNT else "REAL MAINNET")
     tp_u, sl_u = tp_sl_usdt()
     
     print(f"\n  {'─'*72}")
@@ -1569,7 +1600,7 @@ def handle_depth_multiplex(msg):
         _log_err(f"handle_depth_multiplex", e)
 
 def run_bot():
-    acc_type_str = "BINANCE FUTURES DEMO (TESTNET)" if USE_DEMO_ACCOUNT else "BINANCE FUTURES REAL MAINNET"
+    acc_type_str = "PAPER TRADING (SIMULASI, DATA REAL MAINNET)" if PAPER_TRADING else ("BINANCE FUTURES DEMO (TESTNET)" if USE_DEMO_ACCOUNT else "BINANCE FUTURES REAL MAINNET")
     tp_u, sl_u = tp_sl_usdt()
     print("╔════════════════════════════════════════════════════════════════════╗")
     print(f"║  💎 BOT SCALPING v23.5 — LIVE BINANCE API EXECUTION ENGINE         ║")
@@ -1631,7 +1662,7 @@ def run_bot():
         if wk_target[0]: print(f"  🎯 WEEKLY PAUSED: {wk_target[1]} — Menunggu Hari Senin untuk Reset OOT")
         elif (k := ks_check())[0]: print(f"  🚨 KS:{k[1]}")
         elif slots == 0: print(f"  ✅ Slots Full — Monitoring Posisi Terbuka")
-        else: print(f"  🔍 Slot Kosong — Scanning Signal ({'DEMO' if USE_DEMO_ACCOUNT else 'REAL'} | Mode: {mode_str}{forced_str})...")
+        else: print(f"  🔍 Slot Kosong — Scanning Signal ({'PAPER' if PAPER_TRADING else ('DEMO' if USE_DEMO_ACCOUNT else 'REAL')} | Mode: {mode_str}{forced_str})...")
         if cycle % 30 == 0: print_full()
         time.sleep(SCAN_INTERVAL)
 
