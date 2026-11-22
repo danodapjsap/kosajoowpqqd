@@ -1,6 +1,6 @@
 """
 Bot Scalping v23.4 — BINANCE FUTURES LIVE & DEMO EXECUTION ENGINE
-====================================================================
+===================================================================
 UPDATES v23.6:
 - PAPER TRADING: set PAPER_TRADING = True -> tidak ada order yang dikirim ke Binance. Data market (harga, kline,
   order book) tetap real dari Binance Futures mainnet (endpoint publik), entry/exit & PnL disimulasikan lokal
